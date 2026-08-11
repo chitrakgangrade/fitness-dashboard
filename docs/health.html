@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Health & Labs</title>
+<style>
+  :root {
+    --bg: #0a0b0e;
+    --surface: #131419;
+    --surface-2: #1a1c22;
+    --border: #242631;
+    --text: #edeef2;
+    --text-dim: #9497a3;
+    --text-faint: #5a5c66;
+    --accent: #e8a33d;
+    --good: #33c692;
+    --bad: #ef6259;
+    --info: #5b93f0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    padding: 18px 14px 56px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; }
+  .title-row { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 6px; }
+  .title-row h1 { font-size: 15px; font-weight: 650; letter-spacing: 0.2px; margin: 0; }
+  .updated { font-size: 10px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+  .basis { font-size: 11px; color: var(--text-faint); margin-bottom: 16px; }
+  .intro { font-size: 12.5px; color: var(--text-dim); line-height: 1.55; margin-bottom: 20px; }
+
+  .health-card {
+    background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--border);
+    border-radius: 14px; padding: 14px 14px 8px; margin-bottom: 12px;
+  }
+  .health-card.good { border-left-color: var(--good); }
+  .health-card.accent { border-left-color: var(--accent); }
+  .health-card.bad { border-left-color: var(--bad); }
+  .health-card-title { font-size: 13.5px; font-weight: 650; }
+  .health-card-subtitle { font-size: 10.5px; color: var(--text-faint); margin-top: 2px; margin-bottom: 10px; }
+  .health-list { list-style: none; margin: 0 0 6px; padding: 0; }
+  .health-list li {
+    font-size: 12.5px; line-height: 1.55; padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .health-list li:last-child { border-bottom: none; }
+
+  footer { text-align: center; color: var(--text-faint); font-size: 10px; margin-top: 26px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="title-row">
+    <h1>Health &amp; Labs</h1>
+    <div class="updated">updated 2026-08-11</div>
+  </div>
+  <div class="basis">Source: Fitness Plan (Notion) &middot; a static snapshot, refreshed only when that page is edited</div>
+  <div class="intro">Based on lab trends from your Medical Reports folder in Drive (Feb 2023 – May 2026). This is a general fitness/lifestyle plan, not medical advice — a couple of items below should go to your doctor first.</div>
+  
+  <div class="health-card good">
+    <div class="health-card-title">Doing well</div>
+    <div class="health-card-subtitle">&nbsp;</div>
+    <ul class="health-list"><li>Blood sugar control is excellent — HbA1c improved from 5.3% → 4.9%, fasting glucose consistently in range</li><li>Blood pressure normal (120/80), kidney and liver function essentially normal</li><li>Hemoglobin recovered to a healthy 15.8 g/dL, no anemia</li></ul>
+  </div>
+  <div class="health-card accent">
+    <div class="health-card-title">Needs attention</div>
+    <div class="health-card-subtitle">fitness/lifestyle responsive</div>
+    <ul class="health-list"><li>Lipid panel trending the wrong way: Total Cholesterol 243 mg/dL (High), LDL 169 (High), Triglycerides 227 (High), HDL 41 (Low), TC:HDL ratio 5.9 (High)</li><li>Weight 105 kg at 183.5 cm → BMI ~31 (obese range)</li><li>Vitamin D insufficient (26.2 ng/mL, target ≥30)</li><li>Osteopenia flagged at L1-L3 on bone density scan (2024) — weight-bearing exercise matters here</li><li>Vitamin B12 low-end (246 pg/mL)</li></ul>
+  </div>
+  <div class="health-card bad">
+    <div class="health-card-title">Flag for your doctor</div>
+    <div class="health-card-subtitle">not exercise-fixable</div>
+    <ul class="health-list"><li>Prolactin 28.3 ng/mL — flagged HIGH-CRITICAL, up sharply from 8.18</li><li>Homocysteine 21.29 umol/L (High) — relevant to cardiac risk, often tied to B12/folate status</li><li>Persistently high lymphocytes across multiple tests</li></ul>
+  </div>
+  <footer>Not linked from the dashboard &middot; update the Fitness Plan Notion page when you get a new report</footer>
+</div>
+</body>
+</html>
