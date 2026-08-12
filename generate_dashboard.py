@@ -857,12 +857,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .bar.selected { filter: brightness(1.28); }
   .bar-empty { fill: var(--border); }
   .pt { fill: var(--info); cursor: pointer; }
+  .pt.good { fill: var(--good); }
+  .pt.bad { fill: var(--bad); }
   .pt.selected { fill: var(--text); }
   .hit { fill: transparent; cursor: pointer; }
   .sel-band { fill: rgba(232, 163, 61, 0.08); }
   .grid-line { stroke: var(--grid); stroke-width: 1; }
   .ref-line { stroke: var(--grid-strong); stroke-width: 1; stroke-dasharray: 3 3; }
   .trend-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .trend-line.good { stroke: var(--good); }
+  .trend-line.bad { stroke: var(--bad); }
   .raw-line { fill: none; stroke: var(--info); stroke-width: 1; opacity: 0.5; }
   .axis-text { fill: var(--text-faint); font-size: 9px; font-variant-numeric: tabular-nums; }
   .axis-value { fill: var(--text-faint); font-size: 9px; font-variant-numeric: tabular-nums; }
@@ -974,10 +978,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="legend">
         <span class="legend-item"><i class="dot good"></i>deficit</span>
         <span class="legend-item"><i class="dot bad"></i>surplus</span>
-        <span class="legend-item"><i class="dash accent"></i>7d avg deficit</span>
+        <span class="legend-item"><i class="dash accent"></i>7d avg eaten</span>
       </div>
     </div>
     <svg class="chart-svg" id="chart-calories"></svg>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div class="card-label">Deficit Trend</div>
+      <div class="legend">
+        <span class="legend-item"><i class="dot good"></i>7d avg deficit</span>
+        <span class="legend-item"><i class="dot bad"></i>7d avg surplus</span>
+      </div>
+    </div>
+    <svg class="chart-svg" id="chart-deficit"></svg>
+    <div class="empty-note" id="chart-deficit-empty" style="display:none;">Not enough data yet.</div>
   </div>
 
   <div class="card">
@@ -1308,17 +1324,72 @@ function renderLineChart(svgId, emptyId, values, trend, valueFmt, tooltipFn) {
   renderAxis(svg, n, H, slot);
 }
 
+// ---- deficit trend chart ----------------------------------------------------
+// A dedicated zero-crossing chart for the 7-day avg deficit, kept fully
+// separate from the Calories chart's eaten-kcal axis. Plotting it on its own
+// axis (instead of projecting it onto the calories axis) keeps its shape from
+// visually mimicking the eaten trend just because deficit = maintenance -
+// eaten shares a term with it -- here it only ever moves on real deficit
+// swings. Green above zero (deficit), red below (surplus), colored per
+// segment so the line visibly flips color right at a zero-crossing.
+
+function renderDeficitChart(svgId, emptyId, trend, tooltipFn) {
+  const svg = document.getElementById(svgId);
+  const emptyNote = document.getElementById(emptyId);
+  const n = DATA.days.length;
+  const nums = trend.filter(v => v !== null && v !== undefined);
+
+  if (!nums.length) {
+    svg.style.display = 'none';
+    emptyNote.style.display = 'block';
+    return;
+  }
+  svg.style.display = 'block';
+  emptyNote.style.display = 'none';
+
+  const H = 96, padTop = 10, padBottom = 8;
+  const { totalW, slot } = chartLayout(svg, n);
+  chartBase(svg, totalW, H, slot);
+
+  let lo = Math.min(0, ...nums), hi = Math.max(0, ...nums);
+  if (lo === hi) { lo -= 1; hi += 1; }
+  const pad = (hi - lo) * 0.18;
+  lo -= pad; hi += pad;
+  const yOf = v => H - padBottom - ((v - lo) / (hi - lo)) * (H - padTop - padBottom);
+
+  gridLines(svg, totalW, H, padTop, 2, frac => fmtSigned(lo + (1 - frac) * (hi - lo)));
+  refLine(svg, totalW, yOf(0), '0');
+
+  const pts = trend.map(v => v === null || v === undefined ? null : { y: yOf(v), v });
+  for (let i = 0; i < n - 1; i++) {
+    if (pts[i] === null || pts[i + 1] === null) continue;
+    const x1 = PAD_LEFT + i * slot + slot / 2, x2 = PAD_LEFT + (i + 1) * slot + slot / 2;
+    const cls = (pts[i].v + pts[i + 1].v) >= 0 ? 'good' : 'bad';
+    svg.appendChild(svgEl('line', { x1, y1: pts[i].y, x2, y2: pts[i + 1].y, class: 'trend-line ' + cls }));
+  }
+  trend.forEach((v, i) => {
+    if (v === null || v === undefined) return;
+    svg.appendChild(svgEl('circle', {
+      cx: PAD_LEFT + i * slot + slot / 2, cy: yOf(v), r: i === selectedIdx ? 2.8 : 1.6,
+      class: 'pt ' + (v >= 0 ? 'good' : 'bad') + (i === selectedIdx ? ' selected' : '')
+    }));
+  });
+
+  hitColumns(svg, n, H, slot, tooltipFn);
+  renderAxis(svg, n, H, slot);
+}
+
 // ---- orchestration ----------------------------------------------------------
 
 function renderCharts() {
   renderBarChart(
     'chart-calories',
     DATA.days.map(d => d.eaten),
-    // Trend line plots the 7-day avg *deficit*, not avg calories eaten --
-    // expressed as (target - avg deficit) so it lands on the same kcal
-    // y-axis as the bars: it rides above the dashed target line during a
-    // surplus-trending week and dips below it during a deficit-trending one.
-    DATA.days.map(d => d.deficit_trend === null || d.deficit_trend === undefined ? null : DATA.goal_calories - d.deficit_trend),
+    // Trend line here is the plain 7-day avg *eaten* -- kept on the same
+    // kcal axis as the bars it's tracking. The deficit trend itself lives in
+    // its own dedicated chart below, in its own kcal-deficit units, so it
+    // never gets rendered as a disguised copy of this line.
+    DATA.days.map(d => d.eaten_trend),
     i => (DATA.days[i].deficit !== null && DATA.days[i].deficit < 0) ? 'bad' : 'good',
     DATA.goal_calories, DATA.goal_calories.toLocaleString() + ' target',
     i => {
@@ -1326,6 +1397,17 @@ function renderCharts() {
       if (!d.has_data) return tooltipHtml(i, ['no log yet']);
       const rows = [fmtInt(d.eaten) + ' kcal eaten'];
       if (d.deficit !== null) rows.push((d.deficit < 0 ? 'surplus ' : 'deficit ') + fmtInt(Math.abs(d.deficit)) + ' kcal');
+      if (d.eaten_trend !== null && d.eaten_trend !== undefined) rows.push('7d avg ' + fmtInt(d.eaten_trend) + ' kcal eaten');
+      return tooltipHtml(i, rows);
+    }
+  );
+  renderDeficitChart(
+    'chart-deficit', 'chart-deficit-empty',
+    DATA.days.map(d => d.deficit_trend),
+    i => {
+      const d = DATA.days[i];
+      if (!d.has_data || d.deficit === null) return tooltipHtml(i, ['no log yet']);
+      const rows = [(d.deficit < 0 ? 'surplus ' : 'deficit ') + fmtInt(Math.abs(d.deficit)) + ' kcal (today)'];
       if (d.deficit_trend !== null && d.deficit_trend !== undefined) {
         rows.push('7d avg ' + (d.deficit_trend < 0 ? 'surplus ' : 'deficit ') + fmtInt(Math.abs(d.deficit_trend)) + ' kcal');
       }
