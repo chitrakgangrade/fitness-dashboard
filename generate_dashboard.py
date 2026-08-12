@@ -28,6 +28,11 @@ import requests
 try:
     from dotenv import load_dotenv
     load_dotenv()
+    # ANTHROPIC_API_KEY lives in the whatsapp-listener pipeline's .env, not
+    # this project's -- load it as a fallback (won't override anything
+    # already set from the line above) rather than duplicating the secret
+    # into this repo's .env.
+    load_dotenv(os.path.expanduser("~/whatsapp-listener/pipeline/.env"))
 except ImportError:
     pass
 
@@ -40,6 +45,10 @@ HEADERS = {
     "Notion-Version": NOTION_VERSION,
     "Content-Type": "application/json",
 }
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
+TLDR_MODEL = "claude-haiku-4-5-20251001"  # same model/cost tier as house_digest.js's joke generation
 
 MEAL_LOG_ID = "f553a32e-de2b-49fe-a098-3c2bc21ff2de"
 WEIGHT_LOG_ID = "43e0af8d-53cd-4f23-be35-5f1f119161bc"
@@ -54,6 +63,13 @@ FITNESS_PLAN_PAGE_ID = "39054896-5421-8148-8769-cdf10ca47ebe"  # source for heal
 # numbers that happen to share a value today -- kept separate so a future
 # change to one doesn't silently change the other.
 GOAL_PROTEIN = 152          # g, fixed daily protein goal
+# Fat/carb goals aren't documented anywhere in Notion (checked -- only
+# qualitative nutrition direction on the Fitness Plan page, no gram figures)
+# so these are derived, not sourced: fat at ~30% of the 2,500 kcal target
+# (750 kcal / 9 kcal per g), carbs filling the remainder after protein + fat.
+# Confirmed with user 2026-08-13.
+GOAL_FAT = 83               # g (~747 kcal, ~30% of TARGET_CALORIES)
+GOAL_CARBS = 286            # g (~1144 kcal, remainder of TARGET_CALORIES)
 TARGET_CALORIES = 2500      # kcal, flat daily eating target (no activity-based shifting)
 TDEE_FALLBACK = 2500        # kcal, assumed maintenance when Garmin is missing/implausible
 GARMIN_MIN_PLAUSIBLE = 1500 # below this, Garmin's Calories Burned is treated
@@ -295,6 +311,55 @@ def compute_window_summary(days, weight_by_date, start, today):
         "start_weight_avg": start_avg,
         "end_weight_avg": end_avg,
     }
+
+
+def compute_macro_stats(days):
+    """Distribution of logged days into distance-from-target buckets, for
+    protein (target is a floor -- more is fine, less is the problem) and
+    carbs/fat (target is a ceiling -- more is the problem). Buckets are
+    pct-of-goal, not absolute grams, so the same bucket logic works across
+    goals of very different sizes (83g fat vs 286g carbs). The two "off
+    target" buckets on each macro's bad side share a color but differ in
+    opacity, so severity still reads at a glance without needing a 5th
+    color."""
+    specs = [("protein", GOAL_PROTEIN, "floor"), ("carbs", GOAL_CARBS, "ceiling"), ("fat", GOAL_FAT, "ceiling")]
+    out = []
+    for key, goal, kind in specs:
+        vals = [d[key] for d in days if d["has_data"] and not d["is_partial"] and d.get(key) is not None]
+        total = len(vals)
+        # "upper" is each bucket's boundary in grams (None on the open-ended
+        # last bucket) -- used to label where the bar's color actually
+        # switches, so a reader isn't left guessing what "well under" means
+        # in absolute terms for this macro.
+        if kind == "floor":
+            hit = sum(1 for v in vals if v >= goal)
+            bucket_defs = [
+                ("well under", "bad", 1.0, round(goal * 0.75), lambda v: v < goal * 0.75),
+                ("under", "bad", 0.5, round(goal * 0.90), lambda v: goal * 0.75 <= v < goal * 0.90),
+                ("just under", "accent", 1.0, round(goal * 1.00), lambda v: goal * 0.90 <= v < goal * 1.00),
+                ("at/above target", "good", 1.0, None, lambda v: v >= goal * 1.00),
+            ]
+        else:
+            hit = sum(1 for v in vals if v <= goal)
+            bucket_defs = [
+                ("at/under limit", "good", 1.0, round(goal * 1.00), lambda v: v <= goal * 1.00),
+                ("slightly over", "accent", 1.0, round(goal * 1.15), lambda v: goal * 1.00 < v <= goal * 1.15),
+                ("over", "bad", 0.5, round(goal * 1.30), lambda v: goal * 1.15 < v <= goal * 1.30),
+                ("well over", "bad", 1.0, None, lambda v: v > goal * 1.30),
+            ]
+        buckets = []
+        for label, cls, opacity, upper, test in bucket_defs:
+            count = sum(1 for v in vals if test(v))
+            buckets.append({
+                "label": label, "cls": cls, "opacity": opacity, "count": count,
+                "pct": round(100 * count / total) if total else 0, "upper": upper,
+            })
+        out.append({
+            "key": key, "goal": goal, "kind": kind, "hit": hit, "total": total,
+            "hit_pct": round(100 * hit / total) if total else None,
+            "buckets": buckets,
+        })
+    return out
 
 
 CORR_MIN_N = 5  # both groups need at least this many data points to even be
@@ -553,6 +618,181 @@ def fetch_health_summary(page_id):
     return {"intro": intro, "groups": groups}
 
 
+def blocks_to_text(blocks, indent=0):
+    """Recursively flattens a list of Notion blocks into plain indented
+    text -- headings and paragraphs as their own line, list items prefixed
+    with "- ". Recurses into has_children (the Weekly structure section
+    nests its bullets under each paragraph header, unlike the flat
+    sibling layout in the Summary section above)."""
+    lines = []
+    for b in blocks:
+        t = b["type"]
+        text = block_plain_text(b).strip()
+        prefix = "  " * indent
+        if t in ("heading_1", "heading_2", "heading_3") and text:
+            lines.append(f"{prefix}{text}")
+        elif t in ("bulleted_list_item", "numbered_list_item") and text:
+            lines.append(f"{prefix}- {text}")
+        elif t == "paragraph" and text:
+            lines.append(f"{prefix}{text}")
+        if b.get("has_children"):
+            children = notion_get(f"/blocks/{b['id']}/children?page_size=100").get("results", [])
+            lines.extend(blocks_to_text(children, indent + 1))
+    return lines
+
+
+def fetch_plan_text(page_id, section_title):
+    """Extracts one heading_2 section of the Fitness Plan page as plain
+    text (e.g. "The plan" -> Goals/Weekly structure/Nutrition direction),
+    stopping at the next heading_2 or the trailing embedded databases. Used
+    to ground the TL;DR's workout/nutrition recommendation in what's
+    actually written there instead of generic fitness advice."""
+    blocks = notion_get(f"/blocks/{page_id}/children?page_size=100").get("results", [])
+    section_blocks = []
+    capturing = False
+    for b in blocks:
+        if b["type"] == "heading_2":
+            heading = block_plain_text(b).strip().lower()
+            if heading == section_title.lower():
+                capturing = True
+                continue
+            elif capturing:
+                break
+            continue
+        if b["type"] == "child_database" and capturing:
+            break
+        if capturing:
+            section_blocks.append(b)
+    return "\n".join(blocks_to_text(section_blocks))
+
+
+def find_last_complete_day(days):
+    """Most recent day with a real, finished log -- "today" is usually
+    still PENDING when this runs early morning, so this is effectively
+    "yesterday" but doesn't assume anything about what time the cron job
+    runs."""
+    for d in reversed(days):
+        if d["has_data"] and not d["is_partial"]:
+            return d
+    return None
+
+
+def generate_tldr(data, plan_text):
+    """One Claude Haiku call that turns yesterday's numbers + this week's
+    trends + the actual weekly-structure text into a short daily briefing.
+    Returns None (never raises) on any failure -- missing key, network
+    error, empty response -- so a TL;DR outage never breaks the rest of the
+    dashboard generation; the card just doesn't render that day."""
+    if not ANTHROPIC_API_KEY:
+        print("WARN: ANTHROPIC_API_KEY not set, skipping TL;DR")
+        return None
+
+    days = data["days"]
+    yesterday = find_last_complete_day(days)
+    if yesterday is None:
+        return None
+
+    recent = [d for d in days if d["has_data"] and not d["is_partial"]][-7:]
+    week_activity = [
+        {"date": d["date"], "workout": d["activity_badge"], "detail": d["activity_detail"]}
+        for d in recent
+    ]
+
+    context = {
+        "targets": {
+            "calories": data["goal_calories"], "protein_g": data["goal_protein"],
+            "carbs_g": data["goal_carbs"], "fat_g": data["goal_fat"],
+        },
+        "yesterday": {
+            "date": yesterday["date"],
+            "workout": yesterday["activity_badge"], "workout_detail": yesterday["activity_detail"],
+            "eaten_kcal": yesterday["eaten"], "deficit_kcal": yesterday["deficit"],
+            "protein_g": yesterday["protein"], "carbs_g": yesterday["carbs"], "fat_g": yesterday["fat"],
+            "sleep_hours": yesterday["sleep_hours"], "resting_hr": yesterday["resting_hr"],
+            "hrv": yesterday["hrv"], "body_battery": yesterday["body_battery"],
+            "alcohol": yesterday["has_alcohol"],
+        },
+        "trailing_7day_avg_as_of_yesterday": {
+            "deficit_kcal": yesterday.get("deficit_trend"), "protein_g": yesterday.get("protein_trend"),
+            "carbs_g": yesterday.get("carbs_trend"), "fat_g": yesterday.get("fat_trend"),
+            "resting_hr": yesterday.get("rhr_trend"), "hrv": yesterday.get("hrv_trend"),
+            "body_battery": yesterday.get("body_battery_trend"),
+        },
+        "weight_trend": data.get("weight_trend"),
+        "last_7_logged_days_activity": week_activity,
+    }
+
+    prompt = f"""You write a short daily fitness TL;DR for someone tracking calories, macros, weight, workouts, and Garmin recovery metrics (resting HR, HRV, body battery). It's read as a scannable list of short sections, not a paragraph -- so each field below must stand alone.
+
+Their actual weekly plan, from their own notes -- ground your workout call in this, not generic advice:
+---
+{plan_text}
+---
+
+Data (yesterday = their most recent complete logged day; trailing_7day_avg_as_of_yesterday = 7-day rolling averages as of yesterday):
+{json.dumps(context, indent=2)}
+
+Fill in the emit_tldr tool call:
+- workout: did they train yesterday (what kind, or rest)? 1 short sentence.
+- diet: calories/deficit and macros vs target yesterday -- call out anything notably over/under. 1 short sentence.
+- weight: why the weight trend moved (or held), tied to the deficit trend -- not just restating the kg number. 1 short sentence. Leave empty if there isn't enough weight data.
+- recovery: weigh resting HR, HRV, and body battery TOGETHER against their trailing averages -- say plainly if recovery looks fine, shows elevated stress, or looks under-recovered. 1 short sentence.
+- today: concrete instructions for today -- a calorie/carb note plus a specific workout call (rest / strength / cardio / mobility), reasoned from what's due per their weekly plan and how recovery looks. 1-2 short sentences.
+
+Rules: only use numbers actually given above, never invent or estimate a figure that isn't present. If a data point is missing (null), just don't mention it -- don't guess or say "unknown" out loud. Plain prose only, no markdown (no asterisks, bold, bullets, headers) -- each field is rendered as its own already-labeled line, second person ("you")."""
+
+    tool = {
+        "name": "emit_tldr",
+        "description": "Emit the structured daily TL;DR, one short plain-prose sentence per section.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "workout": {"type": "string"},
+                "diet": {"type": "string"},
+                "weight": {"type": "string"},
+                "recovery": {"type": "string"},
+                "today": {"type": "string"},
+            },
+            "required": ["workout", "diet", "weight", "recovery", "today"],
+        },
+    }
+
+    try:
+        resp = requests.post(
+            ANTHROPIC_API,
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": TLDR_MODEL,
+                "max_tokens": 500,
+                "tools": [tool],
+                "tool_choice": {"type": "tool", "name": "emit_tldr"},
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        tool_use = next((b for b in result.get("content", []) if b.get("type") == "tool_use"), None)
+        if not tool_use:
+            print("WARN: TL;DR response had no tool_use block, omitting")
+            return None
+        fields = tool_use.get("input", {})
+        # belt-and-suspenders: strip stray markdown even though the prompt
+        # asks for plain prose -- these render via textContent, not an HTML
+        # parser, so literal asterisks/backticks would otherwise show up
+        cleaned = {k: re.sub(r"[*_`#]+", "", (v or "").strip()) for k, v in fields.items()}
+        if not any(cleaned.values()):
+            return None
+        return cleaned
+    except Exception as e:
+        print(f"WARN: TL;DR generation failed, omitting: {e}")
+        return None
+
+
 # ------------------------------------------------------------- derivations
 
 WORKOUT_NAME_HINTS = [
@@ -749,16 +989,23 @@ def collect():
         day["eaten_trend"] = trailing_avg(days, "eaten", i)
         day["deficit_trend"] = trailing_avg(days, "deficit", i)
         day["protein_trend"] = trailing_avg(days, "protein", i)
+        day["carbs_trend"] = trailing_avg(days, "carbs", i)
+        day["fat_trend"] = trailing_avg(days, "fat", i)
         day["sleep_trend"] = trailing_avg(days, "sleep_hours", i)
         day["rhr_trend"] = trailing_avg(days, "resting_hr", i)
+        day["hrv_trend"] = trailing_avg(days, "hrv", i)
+        day["body_battery_trend"] = trailing_avg(days, "body_battery", i)
 
     return {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "goal_calories": TARGET_CALORIES,
         "goal_protein": GOAL_PROTEIN,
+        "goal_fat": GOAL_FAT,
+        "goal_carbs": GOAL_CARBS,
         "weight_trend": compute_weight_trend(weight_by_date, today),
         "streak": compute_streak(days),
         "window_summary": compute_window_summary(days, weight_by_date, start, today),
+        "macro_stats": compute_macro_stats(days),
         "kcal_per_kg": KCAL_PER_KG_FAT,
         "correlations": compute_correlations(days),
         "corr_min_n": CORR_MIN_N,
@@ -809,6 +1056,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .title-row h1 { font-size: 15px; font-weight: 650; letter-spacing: 0.2px; margin: 0; }
   .updated { font-size: 10px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
 
+  .tldr-card {
+    background: linear-gradient(155deg, rgba(232,163,61,0.10), rgba(232,163,61,0.02));
+    border: 1px solid rgba(232,163,61,0.28); border-radius: 14px;
+    padding: 12px 14px; margin-bottom: 16px;
+  }
+  .tldr-label {
+    font-size: 9px; font-weight: 700; letter-spacing: 1.1px; color: var(--accent);
+    text-transform: uppercase; margin-bottom: 8px;
+  }
+  .tldr-row { display: flex; gap: 8px; padding: 5px 0; align-items: baseline; }
+  .tldr-row + .tldr-row { border-top: 1px solid rgba(255,255,255,0.06); }
+  .tldr-row-icon { font-size: 11.5px; flex-shrink: 0; width: 15px; text-align: center; }
+  .tldr-row-body { min-width: 0; }
+  .tldr-row-name {
+    font-size: 9.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--accent);
+    text-transform: uppercase; margin-bottom: 1px;
+  }
+  .tldr-row-text { font-size: 12px; line-height: 1.5; color: var(--text); }
+  .tldr-row.today { margin-top: 3px; padding-top: 9px; border-top: 1px dashed rgba(232,163,61,0.35); }
+  .tldr-row.today .tldr-row-name { color: var(--text); }
+  .tldr-row.today .tldr-row-text { font-weight: 550; }
+
   .period-label {
     font-size: 10px; font-weight: 700; letter-spacing: 1.1px; color: var(--text-faint);
     text-transform: uppercase; margin: 0 2px 6px;
@@ -842,11 +1111,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   .legend { display: flex; gap: 9px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
   .legend-item { display: flex; align-items: center; font-size: 9px; color: var(--text-faint); white-space: nowrap; }
+  .legend-toggle { cursor: pointer; padding: 2px 5px; border-radius: 5px; transition: background 0.1s, opacity 0.15s; }
+  .legend-toggle:hover { background: var(--surface-2); }
+  .legend-toggle.dimmed { opacity: 0.4; }
+  .legend-toggle.active { background: var(--surface-2); color: var(--text); font-weight: 650; }
   .legend-item .dot { width: 6px; height: 6px; border-radius: 50%; margin-right: 3px; flex-shrink: 0; display: inline-block; }
   .legend-item .dash { width: 9px; height: 2px; margin-right: 3px; flex-shrink: 0; border-radius: 1px; display: inline-block; }
   .dot.good { background: var(--good); }
   .dot.bad { background: var(--bad); }
   .dot.info { background: var(--info); }
+  .dot.accent { background: var(--accent); }
   .dash.accent { background: var(--accent); }
 
   .chart-svg { display: block; width: 100%; height: auto; touch-action: pan-y; }
@@ -859,18 +1133,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .pt { fill: var(--info); cursor: pointer; }
   .pt.good { fill: var(--good); }
   .pt.bad { fill: var(--bad); }
+  .pt.info { fill: var(--info); }
+  .pt.accent { fill: var(--accent); }
   .pt.selected { fill: var(--text); }
   .hit { fill: transparent; cursor: pointer; }
   .sel-band { fill: rgba(232, 163, 61, 0.08); }
   .grid-line { stroke: var(--grid); stroke-width: 1; }
   .ref-line { stroke: var(--grid-strong); stroke-width: 1; stroke-dasharray: 3 3; }
+  .ref-line.good { stroke: var(--good); opacity: 0.55; }
+  .ref-line.info { stroke: var(--info); opacity: 0.55; }
+  .ref-line.accent { stroke: var(--accent); opacity: 0.55; }
   .trend-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
   .trend-line.good { stroke: var(--good); }
   .trend-line.bad { stroke: var(--bad); }
+  .trend-line.info { stroke: var(--info); }
+  .trend-line.accent { stroke: var(--accent); }
+  .macro-line { stroke-width: 1.5; opacity: 0.9; }
   .raw-line { fill: none; stroke: var(--info); stroke-width: 1; opacity: 0.5; }
   .axis-text { fill: var(--text-faint); font-size: 9px; font-variant-numeric: tabular-nums; }
   .axis-value { fill: var(--text-faint); font-size: 9px; font-variant-numeric: tabular-nums; }
   .ref-text { fill: var(--text-faint); font-size: 9px; }
+  .ref-text.good { fill: var(--good); }
+  .ref-text.info { fill: var(--info); }
+  .ref-text.accent { fill: var(--accent); }
 
   .empty-note { font-size: 11.5px; color: var(--text-faint); padding: 14px 2px 6px; text-align: center; }
 
@@ -951,6 +1236,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .insight-stat-n { font-size: 9px; color: var(--text-faint); margin-top: 2px; }
   .insight-vs { font-size: 9.5px; color: var(--text-faint); align-self: center; flex-shrink: 0; }
 
+  .macro-stats { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+  .macro-stat-row { margin-bottom: 10px; }
+  .macro-stat-row:last-child { margin-bottom: 2px; }
+  .macro-stat-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 5px; }
+  .macro-stat-name { font-size: 11.5px; font-weight: 650; }
+  .macro-stat-hit { font-size: 10.5px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .macro-stat-bar-wrap { position: relative; padding-top: 11px; }
+  .macro-stat-tick {
+    position: absolute; top: 0; transform: translateX(-50%);
+    font-size: 8px; color: var(--text-faint); font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  .macro-stat-tick::after {
+    content: ''; position: absolute; left: 50%; top: 9px; width: 1px; height: 4px; background: var(--border);
+  }
+  .macro-stat-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: var(--surface-2); }
+  .macro-stat-seg { height: 100%; }
+  .macro-stat-seg.good { background: var(--good); }
+  .macro-stat-seg.accent { background: var(--accent); }
+  .macro-stat-seg.bad { background: var(--bad); }
+  .macro-stat-legend { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 5px; }
+  .macro-stat-legend-item { font-size: 9px; color: var(--text-faint); white-space: nowrap; }
+  .macro-stat-legend-item b { color: var(--text-dim); font-weight: 650; }
+
   footer { text-align: center; color: var(--text-faint); font-size: 10px; margin-top: 26px; }
 
   @media (max-width: 360px) {
@@ -964,6 +1272,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="title-row">
     <h1>Fitness Dashboard</h1>
     <div class="updated" id="updated"></div>
+  </div>
+
+  <div class="tldr-card" id="tldr-card" style="display:none;">
+    <div class="tldr-label">TL;DR</div>
+    <div id="tldr-rows"></div>
   </div>
 
   <div class="period-label">Last 30 Days</div>
@@ -998,14 +1311,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <div class="card">
     <div class="card-head">
-      <div class="card-label">Protein</div>
-      <div class="legend">
-        <span class="legend-item"><i class="dot good"></i>goal hit</span>
-        <span class="legend-item"><i class="dot bad"></i>under</span>
-        <span class="legend-item"><i class="dash accent"></i>7d avg</span>
+      <div class="card-label">Macros</div>
+      <div class="legend" id="macro-legend">
+        <span class="legend-item legend-toggle" data-macro="protein"><i class="dot good"></i>protein</span>
+        <span class="legend-item legend-toggle" data-macro="carbs"><i class="dot info"></i>carbs</span>
+        <span class="legend-item legend-toggle" data-macro="fat"><i class="dot accent"></i>fat</span>
       </div>
     </div>
-    <svg class="chart-svg" id="chart-protein"></svg>
+    <svg class="chart-svg" id="chart-macros"></svg>
+    <div class="empty-note" id="chart-macros-empty" style="display:none;">No macro data in this window.</div>
+    <div class="macro-stats" id="macro-stats"></div>
   </div>
 
   <div class="card">
@@ -1131,6 +1446,41 @@ function renderWindowStats() {
   }
 }
 
+const TLDR_ROWS = [
+  { key: 'workout', icon: '🏋️', name: 'Workout' },
+  { key: 'diet', icon: '🍽️', name: 'Diet' },
+  { key: 'weight', icon: '⚖️', name: 'Weight' },
+  { key: 'recovery', icon: '🔋', name: 'Recovery' },
+  { key: 'today', icon: '☀️', name: 'Today' },
+];
+
+function renderTLDR() {
+  const card = document.getElementById('tldr-card');
+  const t = DATA.tldr;
+  if (!t) {
+    card.style.display = 'none';
+    return;
+  }
+  const rowsEl = document.getElementById('tldr-rows');
+  rowsEl.innerHTML = '';
+  TLDR_ROWS.forEach(r => {
+    const text = t[r.key];
+    if (!text) return; // e.g. "weight" is skipped when there isn't enough data
+    const row = document.createElement('div');
+    row.className = 'tldr-row' + (r.key === 'today' ? ' today' : '');
+    row.innerHTML = `
+      <div class="tldr-row-icon">${r.icon}</div>
+      <div class="tldr-row-body">
+        <div class="tldr-row-name">${r.name}</div>
+        <div class="tldr-row-text"></div>
+      </div>
+    `;
+    row.querySelector('.tldr-row-text').textContent = text;
+    rowsEl.appendChild(row);
+  });
+  card.style.display = 'block';
+}
+
 function renderStats() {
   const grid = document.getElementById('stat-grid');
   const today = DATA.days[DATA.days.length - 1];
@@ -1154,6 +1504,72 @@ function renderStats() {
   grid.appendChild(statTile('Target', fmtInt(DATA.goal_calories) + ' kcal', DATA.goal_protein + ' g protein', ''));
   grid.appendChild(statTile('Today', eatenLabel, todaySub, ''));
   grid.appendChild(statTile('Streak', streakValue, streakSub, streakClass));
+}
+
+// 30-day distribution of days into distance-from-target buckets, one row
+// per macro -- protein's target is a floor (more is fine), carbs/fat's is a
+// ceiling (less is fine), so the "hit" phrasing and bucket order flip
+// between them but the visual (segmented bar, worst-to-best left to right)
+// stays the same shape for quick side-by-side reading.
+function renderMacroStats() {
+  const el = document.getElementById('macro-stats');
+  el.innerHTML = '';
+  DATA.macro_stats.forEach(m => {
+    const row = document.createElement('div');
+    row.className = 'macro-stat-row';
+    const name = m.key.charAt(0).toUpperCase() + m.key.slice(1);
+    const goalWord = m.kind === 'floor' ? 'target' : 'limit';
+
+    if (!m.total) {
+      row.innerHTML = `
+        <div class="macro-stat-head">
+          <div class="macro-stat-name">${name}</div>
+          <div class="macro-stat-hit">no data yet</div>
+        </div>`;
+      el.appendChild(row);
+      return;
+    }
+
+    const hitWord = m.kind === 'floor' ? 'at/above ' + goalWord : 'at/under ' + goalWord;
+    const segs = m.buckets.map(b =>
+      `<div class="macro-stat-seg ${b.cls}" style="flex-basis:${b.pct}%;opacity:${b.opacity}" title="${b.label}: ${b.count}/${m.total} days"></div>`
+    ).join('');
+
+    // gram range text per bucket, built from each bucket's own upper bound
+    // and the previous bucket's upper bound as its lower bound
+    let prevUpper = null;
+    const ranges = m.buckets.map(b => {
+      const r = b.upper === null ? '>' + prevUpper + 'g' : (prevUpper === null ? '<' + b.upper + 'g' : prevUpper + '-' + b.upper + 'g');
+      prevUpper = b.upper;
+      return r;
+    });
+    const legend = m.buckets.map((b, i) => b.count > 0
+      ? `<span class="macro-stat-legend-item"><b>${b.pct}%</b> ${b.label} (${ranges[i]})</span>` : ''
+    ).join('');
+
+    // tick labels at each internal boundary (skip the open-ended last
+    // bucket), placed at the cumulative day-% where the bar's color
+    // actually switches
+    let cum = 0;
+    const ticks = m.buckets.slice(0, -1).map(b => {
+      cum += b.pct;
+      const t = `<div class="macro-stat-tick" style="left:${cum}%">${b.upper}g</div>`;
+      return t;
+    }).join('');
+
+    row.innerHTML = `
+      <div class="macro-stat-head">
+        <div class="macro-stat-name">${name} <span style="color:var(--text-faint);font-weight:400;">(${m.goal}g ${goalWord})</span></div>
+        <div class="macro-stat-hit">${m.hit}/${m.total} days ${hitWord} (${m.hit_pct}%)</div>
+      </div>
+      <div class="macro-stat-bar-wrap">
+        ${ticks}
+        <div class="macro-stat-bar">${segs}</div>
+      </div>
+      <div class="macro-stat-legend">${legend}</div>
+    `;
+    el.appendChild(row);
+  });
 }
 
 function statTile(eyebrow, value, sub, cls) {
@@ -1302,7 +1718,7 @@ function renderLineChart(svgId, emptyId, values, trend, valueFmt, tooltipFn) {
   const yOf = v => H - padBottom - ((v - lo) / (hi - lo)) * (H - padTop - padBottom);
 
   gridLines(svg, totalW, H, padTop, 2, frac => {
-    const val = lo + (1 - frac) * (hi - lo);
+    const val = lo + frac * (hi - lo);
     return valueFmt(val);
   });
 
@@ -1357,7 +1773,7 @@ function renderDeficitChart(svgId, emptyId, trend, tooltipFn) {
   lo -= pad; hi += pad;
   const yOf = v => H - padBottom - ((v - lo) / (hi - lo)) * (H - padTop - padBottom);
 
-  gridLines(svg, totalW, H, padTop, 2, frac => fmtSigned(lo + (1 - frac) * (hi - lo)));
+  gridLines(svg, totalW, H, padTop, 2, frac => fmtSigned(lo + frac * (hi - lo)));
   refLine(svg, totalW, yOf(0), '0');
 
   const pts = trend.map(v => v === null || v === undefined ? null : { y: yOf(v), v });
@@ -1378,6 +1794,107 @@ function renderDeficitChart(svgId, emptyId, trend, tooltipFn) {
   hitColumns(svg, n, H, slot, tooltipFn);
   renderAxis(svg, n, H, slot);
 }
+
+// ---- macro chart (protein / carbs / fat together) --------------------------
+// All three share one gram axis instead of three separate bar+trend+ref
+// charts (which would stack to 9 layered elements and be unreadable
+// together). Each macro gets its own raw daily line and its own
+// color-matched dashed target line, so the gap between a macro's line and
+// its own reference line is directly readable at a glance.
+
+const MACRO_SERIES = [
+  { key: 'protein', cls: 'good', label: 'protein' },
+  { key: 'carbs', cls: 'info', label: 'carbs' },
+  { key: 'fat', cls: 'accent', label: 'fat' },
+];
+
+// Clicking a macro in the legend isolates it -- the other two macros' lines,
+// points, and target lines fade way down instead of disappearing (keeping
+// them faintly visible avoids the axis/gridlines jumping around when only
+// one macro's range would otherwise drive the scale).
+let macroFocus = null;
+
+function renderMacroChart(svgId, emptyId, tooltipFn) {
+  const svg = document.getElementById(svgId);
+  const emptyNote = document.getElementById(emptyId);
+  const n = DATA.days.length;
+
+  const series = MACRO_SERIES.map(s => ({
+    ...s,
+    values: DATA.days.map(d => d[s.key]),
+    goal: DATA['goal_' + s.key],
+  }));
+  const anyData = series.some(s => s.values.some(v => v !== null && v !== undefined));
+
+  if (!anyData) {
+    svg.style.display = 'none';
+    emptyNote.style.display = 'block';
+    return;
+  }
+  svg.style.display = 'block';
+  emptyNote.style.display = 'none';
+
+  const H = 132, padTop = 8, padBottom = 8;
+  const { totalW, slot } = chartLayout(svg, n);
+  chartBase(svg, totalW, H, slot);
+
+  const allVals = series.flatMap(s => s.values.filter(v => v !== null && v !== undefined));
+  const maxVal = Math.max(...allVals, ...series.map(s => s.goal), 1) * 1.12;
+  const yOf = v => H - padBottom - (v / maxVal) * (H - padTop - padBottom);
+
+  gridLines(svg, totalW, H, padTop, 3, frac => fmtInt(frac * maxVal) + 'g');
+
+  // dashed, color-matched target line per macro, drawn before the data lines
+  // so the data lines sit visually on top
+  series.forEach(s => {
+    const dim = macroFocus && s.key !== macroFocus;
+    const y = yOf(s.goal);
+    svg.appendChild(svgEl('line', {
+      x1: PAD_LEFT, y1: y, x2: totalW, y2: y, class: 'ref-line ' + s.cls,
+      style: dim ? 'opacity:0.12' : ''
+    }));
+    const t = svgEl('text', {
+      x: totalW - 2, y: y - 3, class: 'ref-text ' + s.cls, 'text-anchor': 'end',
+      style: dim ? 'opacity:0.12' : ''
+    });
+    t.textContent = s.label + ' ' + s.goal + 'g';
+    svg.appendChild(t);
+  });
+
+  series.forEach(s => {
+    const dim = macroFocus && s.key !== macroFocus;
+    const pts = s.values.map(v => v === null || v === undefined ? null : { y: yOf(v) });
+    svg.appendChild(svgEl('path', {
+      d: trendPath(pts, slot), class: 'trend-line macro-line ' + s.cls,
+      style: dim ? 'opacity:0.12' : ''
+    }));
+    s.values.forEach((v, i) => {
+      if (v === null || v === undefined) return;
+      svg.appendChild(svgEl('circle', {
+        cx: PAD_LEFT + i * slot + slot / 2, cy: yOf(v), r: i === selectedIdx ? 2.6 : 1.5,
+        class: 'pt ' + s.cls + (i === selectedIdx ? ' selected' : ''),
+        style: dim ? 'opacity:0.12' : ''
+      }));
+    });
+  });
+
+  hitColumns(svg, n, H, slot, tooltipFn);
+  renderAxis(svg, n, H, slot);
+}
+
+function setMacroFocus(key) {
+  macroFocus = (macroFocus === key) ? null : key;
+  document.querySelectorAll('#macro-legend .legend-toggle').forEach(el => {
+    const isThis = el.dataset.macro === macroFocus;
+    el.classList.toggle('active', isThis);
+    el.classList.toggle('dimmed', macroFocus !== null && !isThis);
+  });
+  renderCharts();
+}
+
+document.querySelectorAll('#macro-legend .legend-toggle').forEach(el => {
+  el.addEventListener('click', () => setMacroFocus(el.dataset.macro));
+});
 
 // ---- orchestration ----------------------------------------------------------
 
@@ -1414,21 +1931,18 @@ function renderCharts() {
       return tooltipHtml(i, rows);
     }
   );
-  renderBarChart(
-    'chart-protein',
-    DATA.days.map(d => d.protein),
-    DATA.days.map(d => d.protein_trend),
+  renderMacroChart(
+    'chart-macros', 'chart-macros-empty',
     i => {
       const d = DATA.days[i];
-      if (d.is_partial) return 'info';
-      return (d.protein !== null && d.protein >= DATA.goal_protein) ? 'good' : 'bad';
-    },
-    DATA.goal_protein, DATA.goal_protein + 'g goal',
-    i => {
-      const d = DATA.days[i];
-      if (!d.has_data || d.protein === null) return tooltipHtml(i, ['no log yet']);
-      const rows = [fmt1(d.protein) + ' / ' + DATA.goal_protein + ' g'];
-      if (d.protein_trend !== null && d.protein_trend !== undefined) rows.push('7d avg ' + fmt1(d.protein_trend) + ' g');
+      if (!d.has_data) return tooltipHtml(i, ['no log yet']);
+      const rows = [];
+      MACRO_SERIES.forEach(s => {
+        const v = d[s.key];
+        if (v === null || v === undefined) return;
+        rows.push(s.label + ' ' + fmtInt(v) + ' / ' + DATA['goal_' + s.key] + ' g');
+      });
+      if (!rows.length) rows.push('no macro data');
       return tooltipHtml(i, rows);
     }
   );
@@ -1595,9 +2109,11 @@ function renderCorrelations() {
 }
 
 document.getElementById('updated').textContent = 'updated ' + DATA.generated_at.slice(0, 10);
+renderTLDR();
 renderWindowStats();
 renderStats();
 renderCharts();
+renderMacroStats();
 renderDetail();
 renderCorrelations();
 document.getElementById('footer').textContent = 'generated ' + DATA.generated_at;
@@ -1729,6 +2245,25 @@ def render_health_html(summary, generated_at):
 
 def main():
     data = collect()
+
+    try:
+        plan_text = fetch_plan_text(FITNESS_PLAN_PAGE_ID, "The plan")
+    except Exception as e:
+        print(f"WARN: could not fetch Fitness Plan text for TL;DR context: {e}")
+        plan_text = ""
+    try:
+        data["tldr"] = generate_tldr(data, plan_text)
+    except Exception as e:
+        print(f"WARN: TL;DR generation failed, omitting: {e}")
+        data["tldr"] = None
+    if data["tldr"]:
+        for k in ("workout", "diet", "weight", "recovery", "today"):
+            v = data["tldr"].get(k)
+            if v:
+                print(f"TL;DR [{k}]: {v}")
+    else:
+        print("TL;DR: (skipped)")
+
     html = render_html(data)
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     with open(OUTPUT_PATH, "w") as f:
