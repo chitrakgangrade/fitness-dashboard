@@ -111,6 +111,7 @@ ALCOHOL_KEYWORD_RE = re.compile(
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_PATH = os.path.join(SCRIPT_DIR, "docs", "index.html")
 HEALTH_OUTPUT_PATH = os.path.join(SCRIPT_DIR, "docs", "health.html")  # not linked from index.html on purpose
+TLDR_CACHE_PATH = os.path.join(SCRIPT_DIR, "tldr_cache.json")  # NOT in docs/ -- not public, just a same-day handoff to daily_summary.py's WhatsApp message
 
 
 # ---------------------------------------------------------------- fetching
@@ -2263,6 +2264,18 @@ def main():
                 print(f"TL;DR [{k}]: {v}")
     else:
         print("TL;DR: (skipped)")
+
+    # Cached for daily_summary.py's WhatsApp message so both places show the
+    # identical text instead of two separately-generated (and possibly
+    # slightly different) TL;DRs. Keyed by the actual day it's about, not
+    # today's date, so a consumer can tell whether it's still fresh.
+    last_complete = find_last_complete_day(data["days"])
+    if data["tldr"] and last_complete:
+        try:
+            with open(TLDR_CACHE_PATH, "w") as f:
+                json.dump({"for_date": last_complete["date"], "tldr": data["tldr"]}, f)
+        except Exception as e:
+            print(f"WARN: could not write TL;DR cache: {e}")
 
     html = render_html(data)
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
