@@ -78,6 +78,8 @@ GARMIN_MIN_PLAUSIBLE = 1500 # below this, Garmin's Calories Burned is treated
                              # Reconciliation)
 
 TRAILING_DAYS = 30
+PERIOD_WINDOWS = (7, 14, 30)  # dashboard's period filter -- 30 must stay last
+                               # since it's the default view and equals TRAILING_DAYS
 WEIGHT_LOOKBACK_BUFFER_DAYS = 14  # extra history pulled so the 7-day rolling
                                   # avg is populated even on day 1 of the window
 KCAL_PER_KG_FAT = 7700  # standard approximation for kcal per kg of body fat;
@@ -361,6 +363,35 @@ def compute_macro_stats(days):
             "buckets": buckets,
         })
     return out
+
+
+def compute_period_view(days, weight_by_date, window_days, today):
+    """Trailing-window rollup for the dashboard's 7D/14D/30D period filter:
+    this window's summary + macro distribution, plus the same two for the
+    immediately-preceding window of equal length so the UI can show a
+    period-over-period comparison. The prior window is only included when
+    there's enough trailing history to fill it -- with just TRAILING_DAYS of
+    history fetched, that's true for a 7- or 14-day window but never for the
+    full 30 (would need 60 days on hand), so `prior` is None there and the
+    frontend falls back to a "not enough history yet" note instead of a
+    comparison."""
+    window = days[-window_days:]
+    start = today - dt.timedelta(days=window_days - 1)
+    view = {
+        "window_days": window_days,
+        "window_summary": compute_window_summary(window, weight_by_date, start, today),
+        "macro_stats": compute_macro_stats(window),
+        "prior": None,
+    }
+    if len(days) >= window_days * 2:
+        prior_days = days[-window_days * 2:-window_days]
+        prior_start = start - dt.timedelta(days=window_days)
+        prior_today = start - dt.timedelta(days=1)
+        view["prior"] = {
+            "window_summary": compute_window_summary(prior_days, weight_by_date, prior_start, prior_today),
+            "macro_stats": compute_macro_stats(prior_days),
+        }
+    return view
 
 
 CORR_MIN_N = 5  # both groups need at least this many data points to even be
@@ -1005,8 +1036,9 @@ def collect():
         "goal_carbs": GOAL_CARBS,
         "weight_trend": compute_weight_trend(weight_by_date, today),
         "streak": compute_streak(days),
-        "window_summary": compute_window_summary(days, weight_by_date, start, today),
-        "macro_stats": compute_macro_stats(days),
+        "periods": {
+            str(w): compute_period_view(days, weight_by_date, w, today) for w in PERIOD_WINDOWS
+        },
         "kcal_per_kg": KCAL_PER_KG_FAT,
         "correlations": compute_correlations(days),
         "corr_min_n": CORR_MIN_N,
@@ -1083,23 +1115,49 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     font-size: 10px; font-weight: 700; letter-spacing: 1.1px; color: var(--text-faint);
     text-transform: uppercase; margin: 0 2px 6px;
   }
+  .period-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin: 0 2px 6px; }
+  .period-row .period-label { margin: 0; }
+
+  .period-switch {
+    display: flex; gap: 3px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 9px; padding: 2px; margin-bottom: 14px;
+  }
+  .period-btn {
+    flex: 1; appearance: none; border: none; background: transparent; color: var(--text-dim);
+    font: inherit; font-size: 11px; font-weight: 650; padding: 7px 0; border-radius: 7px;
+    cursor: pointer; letter-spacing: 0.2px;
+  }
+  .period-btn.active { background: var(--surface-2); color: var(--text); }
+
   .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 10px; }
-  .stat-grid + .period-label { margin-top: 14px; }
+  .stat-grid + .period-label, .stat-grid + .period-row { margin-top: 14px; }
   .stat-tile {
     background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
     padding: 11px 10px; min-width: 0;
   }
   .stat-eyebrow {
     font-size: 9px; font-weight: 700; letter-spacing: 1px; color: var(--text-faint);
-    text-transform: uppercase; white-space: nowrap;
+    text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .stat-value {
-    font-size: 18px; font-weight: 650; margin-top: 5px; letter-spacing: -0.2px;
-    font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-size: 17px; font-weight: 650; margin-top: 5px; letter-spacing: -0.2px;
+    font-variant-numeric: tabular-nums; line-height: 1.25; overflow-wrap: break-word;
   }
   .stat-value.good { color: var(--good); }
   .stat-value.bad { color: var(--bad); }
   .stat-sub { font-size: 9.5px; color: var(--text-dim); margin-top: 3px; }
+
+  .compare-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 4px; }
+  .compare-note { font-size: 10.5px; color: var(--text-faint); margin: 0 2px 10px; }
+
+  .section-divider {
+    display: flex; align-items: center; gap: 8px; margin: 20px 2px 10px;
+  }
+  .section-divider .label {
+    font-size: 10px; font-weight: 700; letter-spacing: 1.1px; color: var(--text-faint);
+    text-transform: uppercase; white-space: nowrap;
+  }
+  .section-divider .rule { flex: 1; height: 1px; background: var(--border); }
 
   .card {
     background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
@@ -1179,12 +1237,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     border-radius: 14px; padding: 16px;
   }
   .detail-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; gap: 8px; }
-  .detail-date { font-size: 14.5px; font-weight: 650; }
+  .detail-head-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .detail-date { font-size: 14.5px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .badge {
     font-size: 10px; font-weight: 700; letter-spacing: 0.6px;
     padding: 3px 8px; border-radius: 6px; background: var(--surface-2);
     color: var(--text-dim); border: 1px solid var(--border); white-space: nowrap;
   }
+  .detail-nav { display: flex; gap: 4px; flex-shrink: 0; }
+  .nav-btn {
+    appearance: none; width: 30px; height: 30px; border-radius: 8px; cursor: pointer;
+    background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
+    font-size: 15px; line-height: 1; display: flex; align-items: center; justify-content: center;
+  }
+  .nav-btn:disabled { opacity: 0.3; cursor: default; }
   .metric-block { margin-bottom: 14px; }
   .metric-row {
     display: flex; justify-content: space-between; align-items: baseline;
@@ -1211,7 +1277,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   .meal-item:last-child { border-bottom: none; }
   .meal-main { flex: 1; min-width: 0; }
-  .meal-name { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meal-name { font-size: 12.5px; line-height: 1.35; overflow-wrap: break-word; }
   .meal-slot { font-size: 10px; color: var(--text-faint); margin-top: 1px; }
   .meal-pctbar { width: 40px; height: 4px; background: var(--surface-2); border-radius: 2px; overflow: hidden; flex-shrink: 0; }
   .meal-pctbar-fill { height: 100%; background: var(--accent); }
@@ -1262,9 +1328,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   footer { text-align: center; color: var(--text-faint); font-size: 10px; margin-top: 26px; }
 
-  @media (max-width: 360px) {
-    .stat-value { font-size: 16px; }
+  @media (max-width: 400px) {
+    .stat-value { font-size: 15px; }
     .meal-nums { width: 64px; }
+    .period-btn { font-size: 10px; padding: 6px 0; }
   }
 </style>
 </head>
@@ -1280,7 +1347,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div id="tldr-rows"></div>
   </div>
 
-  <div class="period-label">Last 30 Days</div>
+  <div class="period-switch" id="period-switch">
+    <button class="period-btn" type="button" data-window="7">7D</button>
+    <button class="period-btn" type="button" data-window="14">14D</button>
+    <button class="period-btn active" type="button" data-window="30">30D</button>
+  </div>
+
+  <div class="period-row">
+    <div class="period-label" id="compare-label">Vs. Prior Period</div>
+  </div>
+  <div class="compare-grid" id="compare-grid"></div>
+  <div class="compare-note" id="compare-note" style="display:none;"></div>
+
+  <div class="period-label" id="window-label">Last 30 Days</div>
   <div class="stat-grid" id="stat-grid-window"></div>
 
   <div class="period-label">Today</div>
@@ -1312,16 +1391,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <div class="card">
     <div class="card-head">
-      <div class="card-label">Macros</div>
-      <div class="legend" id="macro-legend">
-        <span class="legend-item legend-toggle" data-macro="protein"><i class="dot good"></i>protein</span>
-        <span class="legend-item legend-toggle" data-macro="carbs"><i class="dot info"></i>carbs</span>
-        <span class="legend-item legend-toggle" data-macro="fat"><i class="dot accent"></i>fat</span>
+      <div class="card-label">Protein</div>
+      <div class="legend">
+        <span class="legend-item"><i class="dot good"></i>at/above target</span>
+        <span class="legend-item"><i class="dot bad"></i>under target</span>
+        <span class="legend-item"><i class="dash accent"></i>7d avg</span>
       </div>
     </div>
-    <svg class="chart-svg" id="chart-macros"></svg>
-    <div class="empty-note" id="chart-macros-empty" style="display:none;">No macro data in this window.</div>
-    <div class="macro-stats" id="macro-stats"></div>
+    <svg class="chart-svg" id="chart-protein"></svg>
   </div>
 
   <div class="card">
@@ -1334,6 +1411,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
     <svg class="chart-svg" id="chart-weight"></svg>
     <div class="empty-note" id="chart-weight-empty" style="display:none;">No weight data in this window.</div>
+  </div>
+
+  <div class="detail" id="detail"></div>
+
+  <div class="card">
+    <div class="card-head">
+      <div class="card-label">Insights</div>
+    </div>
+    <div id="correlations"></div>
+  </div>
+
+  <div class="section-divider"><div class="label">Supporting Metrics</div><div class="rule"></div></div>
+
+  <div class="card">
+    <div class="card-head">
+      <div class="card-label">Macros (all three)</div>
+      <div class="legend" id="macro-legend">
+        <span class="legend-item legend-toggle" data-macro="protein"><i class="dot good"></i>protein</span>
+        <span class="legend-item legend-toggle" data-macro="carbs"><i class="dot info"></i>carbs</span>
+        <span class="legend-item legend-toggle" data-macro="fat"><i class="dot accent"></i>fat</span>
+      </div>
+    </div>
+    <svg class="chart-svg" id="chart-macros"></svg>
+    <div class="empty-note" id="chart-macros-empty" style="display:none;">No macro data in this window.</div>
+    <div class="macro-stats" id="macro-stats"></div>
   </div>
 
   <div class="card">
@@ -1360,15 +1462,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="empty-note" id="chart-rhr-empty" style="display:none;">No resting HR data in this window.</div>
   </div>
 
-  <div class="detail" id="detail"></div>
-
-  <div class="card">
-    <div class="card-head">
-      <div class="card-label">Insights</div>
-    </div>
-    <div id="correlations"></div>
-  </div>
-
   <footer id="footer"></footer>
 </div>
 
@@ -1382,10 +1475,23 @@ for (let i = DATA.days.length - 1; i >= 0; i--) {
   if (DATA.days[i].has_data) { selectedIdx = i; break; }
 }
 
+// ---- period filter (7D/14D/30D) --------------------------------------------
+// Charts/window-stats/macro-stats all read the trailing `windowDays` days;
+// DATA.periods precomputes window_summary + macro_stats (+ prior-period
+// versions for comparison) for each option server-side, since the "actual
+// weight change" figure needs rolling-average weight history from before the
+// window that isn't otherwise shipped to the client. Streak and correlations
+// stay period-independent by design (a streak isn't a windowed concept, and
+// correlations need more days than a 7D/14D slice reliably has).
+let windowDays = 30;
+function windowStart() { return DATA.days.length - windowDays; }
+function visibleDays() { return DATA.days.slice(windowStart()); }
+function periodView() { return DATA.periods[String(windowDays)]; }
+
 function fmtInt(n) { return n === null || n === undefined ? '—' : Math.round(n).toLocaleString(); }
 function fmt1(n) { return n === null || n === undefined ? '—' : n.toFixed(1); }
 function fmtSigned(n) { return n === null || n === undefined ? '—' : (n >= 0 ? '+' : '') + Math.round(n).toLocaleString(); }
-// kg is in the "positive = lost" convention used by DATA.window_summary
+// kg is in the "positive = lost" convention used by window_summary
 function fmtLoss(kg) { return kg === null || kg === undefined ? '—' : fmt1(Math.abs(kg)) + ' kg ' + (kg >= 0 ? 'lost' : 'gained'); }
 
 function svgEl(tag, attrs) {
@@ -1429,7 +1535,8 @@ function hideTooltip() {
 
 function renderWindowStats() {
   const grid = document.getElementById('stat-grid-window');
-  const ws = DATA.window_summary;
+  const ws = periodView().window_summary;
+  document.getElementById('window-label').textContent = 'Last ' + windowDays + ' Days';
   grid.innerHTML = '';
 
   const deficitGood = ws.total_deficit >= 0;
@@ -1446,6 +1553,84 @@ function renderWindowStats() {
     grid.appendChild(statTile('Actual', '—', 'not enough weigh-ins yet', ''));
   }
 }
+
+// ---- period-over-period comparison (deficit / protein / weight) -----------
+// The three metrics called out as the actual focus of this dashboard, each
+// compared against the immediately-preceding window of equal length so
+// "how am I doing" has a baseline instead of just an absolute number.
+
+function renderCompare() {
+  const grid = document.getElementById('compare-grid');
+  const note = document.getElementById('compare-note');
+  const label = document.getElementById('compare-label');
+  const view = periodView();
+  label.textContent = 'Vs. Prior ' + windowDays + ' Days';
+
+  if (!view.prior) {
+    grid.style.display = 'none';
+    note.style.display = 'block';
+    note.textContent = 'Not enough history yet for a ' + windowDays + '-day comparison (need ' + (windowDays * 2) + ' days on hand).';
+    return;
+  }
+  grid.style.display = 'grid';
+  note.style.display = 'none';
+  grid.innerHTML = '';
+
+  const cur = view.window_summary, prior = view.prior.window_summary;
+  const curProtein = view.macro_stats.find(m => m.key === 'protein');
+  const priorProtein = view.prior.macro_stats.find(m => m.key === 'protein');
+
+  const deficitBetter = cur.total_deficit >= prior.total_deficit;
+  grid.appendChild(compareTile(
+    'Deficit',
+    fmtInt(Math.abs(cur.total_deficit)) + ' kcal ' + (cur.total_deficit >= 0 ? 'deficit' : 'surplus'),
+    'prior ' + fmtInt(Math.abs(prior.total_deficit)) + ' kcal ' + (prior.total_deficit >= 0 ? 'deficit' : 'surplus'),
+    deficitBetter
+  ));
+
+  const curHit = curProtein && curProtein.hit_pct, priorHit = priorProtein && priorProtein.hit_pct;
+  grid.appendChild(compareTile(
+    'Protein Hit',
+    curHit !== null && curHit !== undefined ? curHit + '%' : '—',
+    priorHit !== null && priorHit !== undefined ? 'prior ' + priorHit + '%' : 'no prior data',
+    (curHit !== null && curHit !== undefined && priorHit !== null && priorHit !== undefined) ? curHit >= priorHit : null
+  ));
+
+  const curLoss = cur.actual_loss_kg, priorLoss = prior.actual_loss_kg;
+  grid.appendChild(compareTile(
+    'Weight change',
+    curLoss !== null && curLoss !== undefined ? fmtLoss(curLoss) : '—',
+    priorLoss !== null && priorLoss !== undefined ? 'prior ' + fmtLoss(priorLoss) : 'no prior data',
+    (curLoss !== null && curLoss !== undefined && priorLoss !== null && priorLoss !== undefined) ? curLoss >= priorLoss : null
+  ));
+}
+
+function compareTile(eyebrow, value, sub, better) {
+  const el = document.createElement('div');
+  el.className = 'stat-tile';
+  const cls = better === null || better === undefined ? '' : (better ? 'good' : 'bad');
+  el.innerHTML = `
+    <div class="stat-eyebrow">${eyebrow}</div>
+    <div class="stat-value ${cls}">${value}</div>
+    <div class="stat-sub">${sub}</div>
+  `;
+  return el;
+}
+
+function setWindow(w) {
+  windowDays = w;
+  document.querySelectorAll('#period-switch .period-btn').forEach(btn => {
+    btn.classList.toggle('active', Number(btn.dataset.window) === w);
+  });
+  renderCompare();
+  renderWindowStats();
+  renderCharts();
+  renderMacroStats();
+}
+
+document.querySelectorAll('#period-switch .period-btn').forEach(btn => {
+  btn.addEventListener('click', () => setWindow(Number(btn.dataset.window)));
+});
 
 const TLDR_ROWS = [
   { key: 'workout', icon: '🏋️', name: 'Workout' },
@@ -1515,7 +1700,7 @@ function renderStats() {
 function renderMacroStats() {
   const el = document.getElementById('macro-stats');
   el.innerHTML = '';
-  DATA.macro_stats.forEach(m => {
+  periodView().macro_stats.forEach(m => {
     const row = document.createElement('div');
     row.className = 'macro-stat-row';
     const name = m.key.charAt(0).toUpperCase() + m.key.slice(1);
@@ -1600,18 +1785,71 @@ function chartLayout(svg, n) {
 function chartBase(svg, totalW, h, slot) {
   svg.setAttribute('viewBox', `0 0 ${totalW} ${h}`);
   svg.innerHTML = '';
-  svg.appendChild(svgEl('rect', { x: PAD_LEFT + selectedIdx * slot, y: 0, width: slot, height: h, class: 'sel-band' }));
+  const rel = selectedIdx - windowStart();
+  if (rel >= 0 && rel < windowDays) {
+    svg.appendChild(svgEl('rect', { x: PAD_LEFT + rel * slot, y: 0, width: slot, height: h, class: 'sel-band' }));
+  }
 }
 
+// Per-day hover preview only (mouse). Tapping/selecting a day is handled by
+// bindScrub below, bound once per chart to the persistent <svg> element
+// itself rather than these per-render hit rects -- see bindScrub's comment
+// for why.
 function hitColumns(svg, n, h, slot, tooltipFn) {
+  const ws = windowStart();
   for (let i = 0; i < n; i++) {
+    const abs = ws + i;
     const hit = svgEl('rect', { x: PAD_LEFT + i * slot, y: 0, width: slot, height: h, class: 'hit' });
-    hit.addEventListener('pointerenter', e => showTooltip(e, tooltipFn(i)));
+    hit.addEventListener('pointerenter', e => showTooltip(e, tooltipFn(abs)));
     hit.addEventListener('pointermove', positionTooltip);
     hit.addEventListener('pointerleave', hideTooltip);
-    hit.addEventListener('click', () => selectDay(i));
     svg.appendChild(hit);
   }
+}
+
+// Tap-or-drag day selection, bound once per chart at load time (not inside
+// hitColumns, which reruns on every render). A single tap selects the
+// nearest day immediately; a press-and-drag keeps re-resolving to the
+// nearest day as the finger/cursor moves, using native pointer capture so
+// the drag keeps tracking correctly even though renderCharts() clears and
+// rebuilds the SVG's children mid-gesture (capture lives on the outer <svg>
+// element itself, which survives that rebuild; only its children get
+// replaced). This matters most on a phone: with up to 30 columns in one
+// chart, each column's own hit-target can be under 12px wide -- too narrow
+// to tap precisely -- so scrubbing lets you slide to the exact day instead
+// of needing pixel-perfect accuracy on the first touch.
+function bindScrub(svgId, tooltipFn) {
+  const svg = document.getElementById(svgId);
+  let dragId = null;
+  const resolve = clientX => {
+    const rect = svg.getBoundingClientRect();
+    const totalW = Math.max(260, Math.floor(rect.width) || 320);
+    const slot = (totalW - PAD_LEFT) / windowDays;
+    const x = clientX - rect.left - PAD_LEFT;
+    const j = Math.min(windowDays - 1, Math.max(0, Math.floor(x / slot)));
+    return windowStart() + j;
+  };
+  svg.addEventListener('pointerdown', e => {
+    dragId = e.pointerId;
+    try { svg.setPointerCapture(e.pointerId); } catch (err) { /* older SVG pointer-capture support -- tap-to-select still works, just not the drag */ }
+    const abs = resolve(e.clientX);
+    selectDay(abs);
+    showTooltip(e, tooltipFn(abs));
+  });
+  svg.addEventListener('pointermove', e => {
+    if (dragId !== e.pointerId) return;
+    const abs = resolve(e.clientX);
+    selectDay(abs);
+    showTooltip(e, tooltipFn(abs));
+    positionTooltip(e);
+  });
+  const endDrag = e => {
+    if (dragId !== e.pointerId) return;
+    dragId = null;
+    hideTooltip();
+  };
+  svg.addEventListener('pointerup', endDrag);
+  svg.addEventListener('pointercancel', endDrag);
 }
 
 function gridLines(svg, totalW, h, padTop, count, valueAt) {
@@ -1644,11 +1882,12 @@ function trendPath(points, slot) {
 }
 
 function renderAxis(svg, n, h, slot) {
-  const every = 5;
+  const ws = windowStart();
+  const every = n <= 7 ? 1 : (n <= 14 ? 2 : 5);
   for (let i = 0; i < n; i++) {
     if (i % every !== 0 && i !== n - 1) continue;
     const t = svgEl('text', { x: PAD_LEFT + i * slot + slot / 2, y: h + 10, class: 'axis-text', 'text-anchor': 'middle' });
-    t.textContent = DATA.days[i].label.split(' ')[1];
+    t.textContent = DATA.days[ws + i].label.split(' ')[1];
     svg.appendChild(t);
   }
 }
@@ -1657,7 +1896,7 @@ function renderAxis(svg, n, h, slot) {
 
 function renderBarChart(svgId, values, trend, colorFor, refValue, refLabel, tooltipFn) {
   const svg = document.getElementById(svgId);
-  const n = DATA.days.length;
+  const n = windowDays, ws = windowStart();
   const H = 122, padTop = 8;
   const { totalW, slot } = chartLayout(svg, n);
   const barW = Math.max(3, Math.min(22, slot * 0.62));
@@ -1679,7 +1918,7 @@ function renderBarChart(svgId, values, trend, colorFor, refValue, refLabel, tool
     const barH = Math.max(2, (v / maxVal) * (H - padTop));
     svg.appendChild(svgEl('rect', {
       x, y: H - barH, width: barW, height: barH, rx: 2,
-      class: 'bar ' + colorFor(i) + (i === selectedIdx ? ' selected' : '')
+      class: 'bar ' + colorFor(ws + i) + ((ws + i) === selectedIdx ? ' selected' : '')
     }));
   });
 
@@ -1695,7 +1934,7 @@ function renderBarChart(svgId, values, trend, colorFor, refValue, refLabel, tool
 function renderLineChart(svgId, emptyId, values, trend, valueFmt, tooltipFn) {
   const svg = document.getElementById(svgId);
   const emptyNote = document.getElementById(emptyId);
-  const n = DATA.days.length;
+  const n = windowDays, ws = windowStart();
   const nums = values.filter(v => v !== null);
 
   if (!nums.length) {
@@ -1729,8 +1968,9 @@ function renderLineChart(svgId, emptyId, values, trend, valueFmt, tooltipFn) {
   values.forEach((v, i) => {
     if (v === null) return;
     const cx = PAD_LEFT + i * slot + slot / 2;
+    const sel = (ws + i) === selectedIdx;
     svg.appendChild(svgEl('circle', {
-      cx, cy: yOf(v), r: i === selectedIdx ? 2.8 : 1.8, class: 'pt' + (i === selectedIdx ? ' selected' : '')
+      cx, cy: yOf(v), r: sel ? 2.8 : 1.8, class: 'pt' + (sel ? ' selected' : '')
     }));
   });
 
@@ -1753,7 +1993,7 @@ function renderLineChart(svgId, emptyId, values, trend, valueFmt, tooltipFn) {
 function renderDeficitChart(svgId, emptyId, trend, tooltipFn) {
   const svg = document.getElementById(svgId);
   const emptyNote = document.getElementById(emptyId);
-  const n = DATA.days.length;
+  const n = windowDays, ws = windowStart();
   const nums = trend.filter(v => v !== null && v !== undefined);
 
   if (!nums.length) {
@@ -1786,9 +2026,10 @@ function renderDeficitChart(svgId, emptyId, trend, tooltipFn) {
   }
   trend.forEach((v, i) => {
     if (v === null || v === undefined) return;
+    const sel = (ws + i) === selectedIdx;
     svg.appendChild(svgEl('circle', {
-      cx: PAD_LEFT + i * slot + slot / 2, cy: yOf(v), r: i === selectedIdx ? 2.8 : 1.6,
-      class: 'pt ' + (v >= 0 ? 'good' : 'bad') + (i === selectedIdx ? ' selected' : '')
+      cx: PAD_LEFT + i * slot + slot / 2, cy: yOf(v), r: sel ? 2.8 : 1.6,
+      class: 'pt ' + (v >= 0 ? 'good' : 'bad') + (sel ? ' selected' : '')
     }));
   });
 
@@ -1818,11 +2059,11 @@ let macroFocus = null;
 function renderMacroChart(svgId, emptyId, tooltipFn) {
   const svg = document.getElementById(svgId);
   const emptyNote = document.getElementById(emptyId);
-  const n = DATA.days.length;
+  const n = windowDays, ws = windowStart();
 
   const series = MACRO_SERIES.map(s => ({
     ...s,
-    values: DATA.days.map(d => d[s.key]),
+    values: visibleDays().map(d => d[s.key]),
     goal: DATA['goal_' + s.key],
   }));
   const anyData = series.some(s => s.values.some(v => v !== null && v !== undefined));
@@ -1871,9 +2112,10 @@ function renderMacroChart(svgId, emptyId, tooltipFn) {
     }));
     s.values.forEach((v, i) => {
       if (v === null || v === undefined) return;
+      const sel = (ws + i) === selectedIdx;
       svg.appendChild(svgEl('circle', {
-        cx: PAD_LEFT + i * slot + slot / 2, cy: yOf(v), r: i === selectedIdx ? 2.6 : 1.5,
-        class: 'pt ' + s.cls + (i === selectedIdx ? ' selected' : ''),
+        cx: PAD_LEFT + i * slot + slot / 2, cy: yOf(v), r: sel ? 2.6 : 1.5,
+        class: 'pt ' + s.cls + (sel ? ' selected' : ''),
         style: dim ? 'opacity:0.12' : ''
       }));
     });
@@ -1898,89 +2140,128 @@ document.querySelectorAll('#macro-legend .legend-toggle').forEach(el => {
 });
 
 // ---- orchestration ----------------------------------------------------------
+// Each chart's tooltip generator is a stable, named, top-level function
+// (rather than an inline closure rebuilt on every renderCharts() call) so
+// bindScrub can hold a reference to it and be bound to its <svg> exactly
+// once at startup -- see bindScrub's comment for why re-binding on every
+// render would be wrong.
+
+function caloriesTooltip(i) {
+  const d = DATA.days[i];
+  if (!d.has_data) return tooltipHtml(i, ['no log yet']);
+  const rows = [fmtInt(d.eaten) + ' kcal eaten'];
+  if (d.deficit !== null) rows.push((d.deficit < 0 ? 'surplus ' : 'deficit ') + fmtInt(Math.abs(d.deficit)) + ' kcal');
+  if (d.eaten_trend !== null && d.eaten_trend !== undefined) rows.push('7d avg ' + fmtInt(d.eaten_trend) + ' kcal eaten');
+  return tooltipHtml(i, rows);
+}
+
+function deficitTooltip(i) {
+  const d = DATA.days[i];
+  if (!d.has_data || d.deficit === null) return tooltipHtml(i, ['no log yet']);
+  const rows = [(d.deficit < 0 ? 'surplus ' : 'deficit ') + fmtInt(Math.abs(d.deficit)) + ' kcal (today)'];
+  if (d.deficit_trend !== null && d.deficit_trend !== undefined) {
+    rows.push('7d avg ' + (d.deficit_trend < 0 ? 'surplus ' : 'deficit ') + fmtInt(Math.abs(d.deficit_trend)) + ' kcal');
+  }
+  return tooltipHtml(i, rows);
+}
+
+function proteinTooltip(i) {
+  const d = DATA.days[i];
+  if (!d.has_data || d.protein === null || d.protein === undefined) return tooltipHtml(i, ['no log yet']);
+  const rows = [fmtInt(d.protein) + ' / ' + DATA.goal_protein + ' g protein'];
+  if (d.protein_trend !== null && d.protein_trend !== undefined) rows.push('7d avg ' + fmtInt(d.protein_trend) + ' g');
+  return tooltipHtml(i, rows);
+}
+
+function macroTooltip(i) {
+  const d = DATA.days[i];
+  if (!d.has_data) return tooltipHtml(i, ['no log yet']);
+  const rows = [];
+  MACRO_SERIES.forEach(s => {
+    const v = d[s.key];
+    if (v === null || v === undefined) return;
+    rows.push(s.label + ' ' + fmtInt(v) + ' / ' + DATA['goal_' + s.key] + ' g');
+  });
+  if (!rows.length) rows.push('no macro data');
+  return tooltipHtml(i, rows);
+}
+
+function weightTooltip(i) {
+  const d = DATA.days[i];
+  if (d.weight === null || d.weight === undefined) return tooltipHtml(i, ['no weigh-in']);
+  const rows = [fmt1(d.weight) + ' kg'];
+  if (d.weight_7day_avg !== null && d.weight_7day_avg !== undefined) rows.push('7d avg ' + fmt1(d.weight_7day_avg) + ' kg');
+  return tooltipHtml(i, rows);
+}
+
+function sleepTooltip(i) {
+  const d = DATA.days[i];
+  if (d.sleep_hours === null || d.sleep_hours === undefined) return tooltipHtml(i, ['no data']);
+  const rows = [fmt1(d.sleep_hours) + ' h'];
+  if (d.sleep_trend !== null && d.sleep_trend !== undefined) rows.push('7d avg ' + fmt1(d.sleep_trend) + ' h');
+  return tooltipHtml(i, rows);
+}
+
+function rhrTooltip(i) {
+  const d = DATA.days[i];
+  if (d.resting_hr === null || d.resting_hr === undefined) return tooltipHtml(i, ['no data']);
+  const rows = [fmtInt(d.resting_hr) + ' bpm'];
+  if (d.rhr_trend !== null && d.rhr_trend !== undefined) rows.push('7d avg ' + fmtInt(d.rhr_trend) + ' bpm');
+  return tooltipHtml(i, rows);
+}
 
 function renderCharts() {
   renderBarChart(
     'chart-calories',
-    DATA.days.map(d => d.eaten),
+    visibleDays().map(d => d.eaten),
     // Trend line here is the plain 7-day avg *eaten* -- kept on the same
     // kcal axis as the bars it's tracking. The deficit trend itself lives in
     // its own dedicated chart below, in its own kcal-deficit units, so it
     // never gets rendered as a disguised copy of this line.
-    DATA.days.map(d => d.eaten_trend),
+    visibleDays().map(d => d.eaten_trend),
     i => (DATA.days[i].deficit !== null && DATA.days[i].deficit < 0) ? 'bad' : 'good',
     DATA.goal_calories, DATA.goal_calories.toLocaleString() + ' target',
-    i => {
-      const d = DATA.days[i];
-      if (!d.has_data) return tooltipHtml(i, ['no log yet']);
-      const rows = [fmtInt(d.eaten) + ' kcal eaten'];
-      if (d.deficit !== null) rows.push((d.deficit < 0 ? 'surplus ' : 'deficit ') + fmtInt(Math.abs(d.deficit)) + ' kcal');
-      if (d.eaten_trend !== null && d.eaten_trend !== undefined) rows.push('7d avg ' + fmtInt(d.eaten_trend) + ' kcal eaten');
-      return tooltipHtml(i, rows);
-    }
+    caloriesTooltip
   );
   renderDeficitChart(
     'chart-deficit', 'chart-deficit-empty',
-    DATA.days.map(d => d.deficit_trend),
-    i => {
-      const d = DATA.days[i];
-      if (!d.has_data || d.deficit === null) return tooltipHtml(i, ['no log yet']);
-      const rows = [(d.deficit < 0 ? 'surplus ' : 'deficit ') + fmtInt(Math.abs(d.deficit)) + ' kcal (today)'];
-      if (d.deficit_trend !== null && d.deficit_trend !== undefined) {
-        rows.push('7d avg ' + (d.deficit_trend < 0 ? 'surplus ' : 'deficit ') + fmtInt(Math.abs(d.deficit_trend)) + ' kcal');
-      }
-      return tooltipHtml(i, rows);
-    }
+    visibleDays().map(d => d.deficit_trend),
+    deficitTooltip
   );
-  renderMacroChart(
-    'chart-macros', 'chart-macros-empty',
-    i => {
-      const d = DATA.days[i];
-      if (!d.has_data) return tooltipHtml(i, ['no log yet']);
-      const rows = [];
-      MACRO_SERIES.forEach(s => {
-        const v = d[s.key];
-        if (v === null || v === undefined) return;
-        rows.push(s.label + ' ' + fmtInt(v) + ' / ' + DATA['goal_' + s.key] + ' g');
-      });
-      if (!rows.length) rows.push('no macro data');
-      return tooltipHtml(i, rows);
-    }
+  renderBarChart(
+    'chart-protein',
+    visibleDays().map(d => d.protein),
+    visibleDays().map(d => d.protein_trend),
+    i => (DATA.days[i].protein !== null && DATA.days[i].protein >= DATA.goal_protein) ? 'good' : 'bad',
+    DATA.goal_protein, DATA.goal_protein + 'g target',
+    proteinTooltip
   );
+  renderMacroChart('chart-macros', 'chart-macros-empty', macroTooltip);
   renderLineChart(
     'chart-weight', 'chart-weight-empty',
-    DATA.days.map(d => d.weight), DATA.days.map(d => d.weight_7day_avg), fmt1,
-    i => {
-      const d = DATA.days[i];
-      if (d.weight === null || d.weight === undefined) return tooltipHtml(i, ['no weigh-in']);
-      const rows = [fmt1(d.weight) + ' kg'];
-      if (d.weight_7day_avg !== null && d.weight_7day_avg !== undefined) rows.push('7d avg ' + fmt1(d.weight_7day_avg) + ' kg');
-      return tooltipHtml(i, rows);
-    }
+    visibleDays().map(d => d.weight), visibleDays().map(d => d.weight_7day_avg), fmt1,
+    weightTooltip
   );
   renderLineChart(
     'chart-sleep', 'chart-sleep-empty',
-    DATA.days.map(d => d.sleep_hours), DATA.days.map(d => d.sleep_trend), v => fmt1(v) + 'h',
-    i => {
-      const d = DATA.days[i];
-      if (d.sleep_hours === null || d.sleep_hours === undefined) return tooltipHtml(i, ['no data']);
-      const rows = [fmt1(d.sleep_hours) + ' h'];
-      if (d.sleep_trend !== null && d.sleep_trend !== undefined) rows.push('7d avg ' + fmt1(d.sleep_trend) + ' h');
-      return tooltipHtml(i, rows);
-    }
+    visibleDays().map(d => d.sleep_hours), visibleDays().map(d => d.sleep_trend), v => fmt1(v) + 'h',
+    sleepTooltip
   );
   renderLineChart(
     'chart-rhr', 'chart-rhr-empty',
-    DATA.days.map(d => d.resting_hr), DATA.days.map(d => d.rhr_trend), fmtInt,
-    i => {
-      const d = DATA.days[i];
-      if (d.resting_hr === null || d.resting_hr === undefined) return tooltipHtml(i, ['no data']);
-      const rows = [fmtInt(d.resting_hr) + ' bpm'];
-      if (d.rhr_trend !== null && d.rhr_trend !== undefined) rows.push('7d avg ' + fmtInt(d.rhr_trend) + ' bpm');
-      return tooltipHtml(i, rows);
-    }
+    visibleDays().map(d => d.resting_hr), visibleDays().map(d => d.rhr_trend), fmtInt,
+    rhrTooltip
   );
 }
+
+// Bound once per chart, not inside renderCharts() -- see bindScrub's comment.
+bindScrub('chart-calories', caloriesTooltip);
+bindScrub('chart-deficit', deficitTooltip);
+bindScrub('chart-protein', proteinTooltip);
+bindScrub('chart-macros', macroTooltip);
+bindScrub('chart-weight', weightTooltip);
+bindScrub('chart-sleep', sleepTooltip);
+bindScrub('chart-rhr', rhrTooltip);
 
 let resizeTimer;
 window.addEventListener('resize', () => {
@@ -1994,6 +2275,23 @@ function selectDay(i) {
   renderDetail();
 }
 
+// Prev/next buttons for stepping through days one at a time during research
+// -- useful on its own, and a precise complement to chart tap/scrub for
+// getting to an exact day without depending on touch accuracy at all.
+function detailNavHtml() {
+  return `
+    <div class="detail-nav">
+      <button class="nav-btn" id="detail-prev" type="button" aria-label="Previous day"${selectedIdx <= 0 ? ' disabled' : ''}>‹</button>
+      <button class="nav-btn" id="detail-next" type="button" aria-label="Next day"${selectedIdx >= DATA.days.length - 1 ? ' disabled' : ''}>›</button>
+    </div>
+  `;
+}
+function bindDetailNav() {
+  const prev = document.getElementById('detail-prev'), next = document.getElementById('detail-next');
+  if (prev) prev.addEventListener('click', () => selectDay(selectedIdx - 1));
+  if (next) next.addEventListener('click', () => selectDay(selectedIdx + 1));
+}
+
 function renderDetail() {
   const d = DATA.days[selectedIdx];
   const el = document.getElementById('detail');
@@ -2001,11 +2299,15 @@ function renderDetail() {
   if (!d.has_data) {
     el.innerHTML = `
       <div class="detail-head">
-        <div class="detail-date">${d.label}${d.is_today ? ' (today)' : ''}</div>
-        <div class="badge">${d.activity_badge}</div>
+        <div class="detail-head-left">
+          <div class="detail-date">${d.label}${d.is_today ? ' (today)' : ''}</div>
+          <div class="badge">${d.activity_badge}</div>
+        </div>
+        ${detailNavHtml()}
       </div>
       <div class="empty-note">No meal log entry yet for this day.</div>
     `;
+    bindDetailNav();
     return;
   }
 
@@ -2035,8 +2337,11 @@ function renderDetail() {
 
   el.innerHTML = `
     <div class="detail-head">
-      <div class="detail-date">${d.label}${d.is_today ? ' (today, in progress)' : ''}</div>
-      <div class="badge">${d.activity_badge}</div>
+      <div class="detail-head-left">
+        <div class="detail-date">${d.label}${d.is_today ? ' (today, in progress)' : ''}</div>
+        <div class="badge">${d.activity_badge}</div>
+      </div>
+      ${detailNavHtml()}
     </div>
 
     <div class="metric-block">
@@ -2074,6 +2379,7 @@ function renderDetail() {
     <div class="meal-list">${itemsHtml}</div>
     ${d.notes ? `<div class="notes">${escapeHtml(d.notes)}</div>` : ''}
   `;
+  bindDetailNav();
 }
 
 function escapeHtml(s) {
@@ -2111,6 +2417,7 @@ function renderCorrelations() {
 
 document.getElementById('updated').textContent = 'updated ' + DATA.generated_at.slice(0, 10);
 renderTLDR();
+renderCompare();
 renderWindowStats();
 renderStats();
 renderCharts();
@@ -2310,7 +2617,7 @@ def print_summary(data):
         )
     else:
         print("Streak: not enough complete days yet")
-    ws = data["window_summary"]
+    ws = data["periods"][str(TRAILING_DAYS)]["window_summary"]
     print(
         f"{TRAILING_DAYS}-day window: total deficit {ws['total_deficit']:+d} kcal "
         f"({ws['days_counted']}/{ws['days_total']} days logged) "
