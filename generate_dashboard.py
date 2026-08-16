@@ -1020,6 +1020,12 @@ def collect():
     for i, day in enumerate(days):
         day["eaten_trend"] = trailing_avg(days, "eaten", i)
         day["deficit_trend"] = trailing_avg(days, "deficit", i)
+        # Second-order smoothing on top of the 7-day deficit average itself --
+        # the 7-day line still flips green/red at every local zero-crossing,
+        # which reads as noisy even though it's already smoothed daily data.
+        # This longer window is for seeing the overall direction of travel on
+        # the chart, not for any calculation.
+        day["deficit_trend_14"] = trailing_avg(days, "deficit", i, window=14)
         day["protein_trend"] = trailing_avg(days, "protein", i)
         day["carbs_trend"] = trailing_avg(days, "carbs", i)
         day["fat_trend"] = trailing_avg(days, "fat", i)
@@ -1383,6 +1389,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="legend">
         <span class="legend-item"><i class="dot good"></i>7d avg deficit</span>
         <span class="legend-item"><i class="dot bad"></i>7d avg surplus</span>
+        <span class="legend-item"><i class="dash accent"></i>14d avg (trend)</span>
       </div>
     </div>
     <svg class="chart-svg" id="chart-deficit"></svg>
@@ -1990,7 +1997,7 @@ function renderLineChart(svgId, emptyId, values, trend, valueFmt, tooltipFn) {
 // swings. Green above zero (deficit), red below (surplus), colored per
 // segment so the line visibly flips color right at a zero-crossing.
 
-function renderDeficitChart(svgId, emptyId, trend, tooltipFn) {
+function renderDeficitChart(svgId, emptyId, trend, smooth, tooltipFn) {
   const svg = document.getElementById(svgId);
   const emptyNote = document.getElementById(emptyId);
   const n = windowDays, ws = windowStart();
@@ -2008,7 +2015,8 @@ function renderDeficitChart(svgId, emptyId, trend, tooltipFn) {
   const { totalW, slot } = chartLayout(svg, n);
   chartBase(svg, totalW, H, slot);
 
-  let lo = Math.min(0, ...nums), hi = Math.max(0, ...nums);
+  const smoothNums = smooth.filter(v => v !== null && v !== undefined);
+  let lo = Math.min(0, ...nums, ...smoothNums), hi = Math.max(0, ...nums, ...smoothNums);
   if (lo === hi) { lo -= 1; hi += 1; }
   const pad = (hi - lo) * 0.18;
   lo -= pad; hi += pad;
@@ -2032,6 +2040,14 @@ function renderDeficitChart(svgId, emptyId, trend, tooltipFn) {
       class: 'pt ' + (v >= 0 ? 'good' : 'bad') + (sel ? ' selected' : '')
     }));
   });
+
+  // Single-color 14-day average overlay, drawn on top -- the 7-day line
+  // above is already smoothed data, but flips green/red at every local
+  // zero-crossing, which reads as noisy even when the underlying direction
+  // is calm. This line never changes color, so the overall trend is legible
+  // independent of that day-to-day sign noise.
+  const smoothPts = smooth.map(v => v === null || v === undefined ? null : { y: yOf(v) });
+  svg.appendChild(svgEl('path', { d: trendPath(smoothPts, slot), class: 'trend-line accent' }));
 
   hitColumns(svg, n, H, slot, tooltipFn);
   renderAxis(svg, n, H, slot);
@@ -2162,6 +2178,9 @@ function deficitTooltip(i) {
   if (d.deficit_trend !== null && d.deficit_trend !== undefined) {
     rows.push('7d avg ' + (d.deficit_trend < 0 ? 'surplus ' : 'deficit ') + fmtInt(Math.abs(d.deficit_trend)) + ' kcal');
   }
+  if (d.deficit_trend_14 !== null && d.deficit_trend_14 !== undefined) {
+    rows.push('14d avg ' + (d.deficit_trend_14 < 0 ? 'surplus ' : 'deficit ') + fmtInt(Math.abs(d.deficit_trend_14)) + ' kcal');
+  }
   return tooltipHtml(i, rows);
 }
 
@@ -2226,6 +2245,7 @@ function renderCharts() {
   renderDeficitChart(
     'chart-deficit', 'chart-deficit-empty',
     visibleDays().map(d => d.deficit_trend),
+    visibleDays().map(d => d.deficit_trend_14),
     deficitTooltip
   );
   renderBarChart(
