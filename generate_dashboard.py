@@ -1339,6 +1339,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <div class="wrap">
   <div class="title-row">
     <h1>Fitness Dashboard</h1>
+    __PROFILE_NAV__
     <div class="updated" id="updated"></div>
   </div>
 
@@ -2431,8 +2432,14 @@ document.getElementById('footer').textContent = 'generated ' + DATA.generated_at
 """
 
 
+DEFAULT_PROFILE_NAV = '<a href="alpi.html" style="font-size:12px;color:var(--text-dim);text-decoration:none;border:1px solid var(--border);border-radius:6px;padding:4px 10px;white-space:nowrap;">🔒 Alpi\'s dashboard</a>'
+
+
 def render_html(data):
-    return HTML_TEMPLATE.replace("__DATA_JSON__", json.dumps(data))
+    return (
+        HTML_TEMPLATE.replace("__DATA_JSON__", json.dumps(data))
+        .replace("__PROFILE_NAV__", data.get("profile_nav_html", DEFAULT_PROFILE_NAV))
+    )
 
 
 # ---------------------------------------------------------------- health.html

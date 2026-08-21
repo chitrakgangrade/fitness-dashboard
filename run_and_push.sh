@@ -13,6 +13,7 @@ git fetch origin main
 git merge --ff-only origin/main
 
 /usr/bin/python3 generate_dashboard.py
+/usr/bin/python3 generate_alpi_dashboard.py
 
 if [[ -n "$(git status --porcelain docs/)" ]]; then
   git add docs/
